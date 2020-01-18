@@ -17,6 +17,7 @@ set(spm_CONF_FILE
   ${CMAKE_CURRENT_LIST_DIR}/child_secure_partition_manager.conf
   )
 
+include(../../../../nrf/cmake/boilerplate.cmake NO_POLICY_SCOPE)
 include($ENV{ZEPHYR_BASE}/cmake/app/boilerplate.cmake NO_POLICY_SCOPE)
 project(lte-ble-gateway)
 

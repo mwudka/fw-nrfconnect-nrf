@@ -42,8 +42,8 @@
 	status = "okay";
 	tx-pin = <15>;
 	rx-pin = <11>;
-	rts-pin = <21>;
-	cts-pin = <20>;
+	rts-pin = <0xFFFFFFFF>;
+	cts-pin = <0xFFFFFFFF>;
 };
 
 &uart1 {

@@ -6,220 +6,299 @@
 
 #include <zephyr.h>
 
-#include <bluetooth/gatt.h>
-#include <bluetooth/uuid.h>
-#include <bluetooth/gatt_dm.h>
-#include <bluetooth/scan.h>
-
 #include <dk_buttons_and_leds.h>
 #include <misc/byteorder.h>
 
 #include <nrf_cloud.h>
 #include "aggregator.h"
+#include <bluetooth/bluetooth.h>
+#include <bluetooth/hci.h>
+#include <bluetooth/conn.h>
+#include <bluetooth/uuid.h>
+#include <bluetooth/gatt.h>
+#include <bluetooth/services/bas.h>
+#include <bluetooth/services/hrs.h>
 
-/* Thinghy advertisement UUID */
-#define BT_UUID_THINGY                                                         \
-	BT_UUID_DECLARE_128(0x42, 0x00, 0x74, 0xA9, 0xFF, 0x52, 0x10, 0x9B,    \
-			    0x33, 0x49, 0x35, 0x9B, 0x00, 0x01, 0x68, 0xEF)
+/* Custom Service Variables */
+static struct bt_uuid_128 vnd_uuid = BT_UUID_INIT_128(
+	0xf0, 0xde, 0xbc, 0x9a, 0x78, 0x56, 0x34, 0x12,
+	0x78, 0x56, 0x34, 0x12, 0x78, 0x56, 0x34, 0x12);
 
-/* Thingy service UUID */
-#define BT_UUID_TMS                                                            \
-	BT_UUID_DECLARE_128(0x42, 0x00, 0x74, 0xA9, 0xFF, 0x52, 0x10, 0x9B,    \
-			    0x33, 0x49, 0x35, 0x9B, 0x00, 0x04, 0x68, 0xEF)
+static struct bt_uuid_128 vnd_enc_uuid = BT_UUID_INIT_128(
+	0xf1, 0xde, 0xbc, 0x9a, 0x78, 0x56, 0x34, 0x12,
+	0x78, 0x56, 0x34, 0x12, 0x78, 0x56, 0x34, 0x12);
 
-/* Thingy characteristic UUID */
-#define BT_UUID_TOC                                                            \
-	BT_UUID_DECLARE_128(0x42, 0x00, 0x74, 0xA9, 0xFF, 0x52, 0x10, 0x9B,    \
-			    0x33, 0x49, 0x35, 0x9B, 0x03, 0x04, 0x68, 0xEF)
+static struct bt_uuid_128 vnd_auth_uuid = BT_UUID_INIT_128(
+	0xf2, 0xde, 0xbc, 0x9a, 0x78, 0x56, 0x34, 0x12,
+	0x78, 0x56, 0x34, 0x12, 0x78, 0x56, 0x34, 0x12);
 
-extern void alarm(void);
+static u8_t vnd_value[] = { 'V', 'e', 'n', 'd', 'o', 'r' };
 
-static u8_t on_received(struct bt_conn *conn,
-			struct bt_gatt_subscribe_params *params,
-			const void *data, u16_t length)
+static ssize_t read_vnd(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+			void *buf, u16_t len, u16_t offset)
 {
-	if (length > 0) {
-		printk("Orientation: %x\n", ((u8_t *)data)[0]);
-		struct sensor_data in_data;
+	const char *value = attr->user_data;
 
-		in_data.type = THINGY_ORIENTATION;
-		in_data.length = 1;
-		in_data.data[0] = ((u8_t *)data)[0];
-
-		if (aggregator_put(in_data) != 0) {
-			printk("Was not able to insert Thingy orientation data into aggregator.\n");
-		}
-		/* If the thingy is upside down, trigger an alarm. */
-		if (((u8_t *)data)[0] == 3) {
-			alarm();
-		}
-
-	} else {
-		printk("Orientation notification with 0 length\n");
-	}
-	return BT_GATT_ITER_CONTINUE;
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, value,
+				 strlen(value));
 }
 
-static void discovery_completed(struct bt_gatt_dm *disc, void *ctx)
+static ssize_t write_vnd(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+			 const void *buf, u16_t len, u16_t offset,
+			 u8_t flags)
 {
-	int err;
+	u8_t *value = attr->user_data;
 
-	/* Must be statically allocated */
-	static struct bt_gatt_subscribe_params param = {
-		.notify = on_received,
-		.value = BT_GATT_CCC_NOTIFY,
-	};
-
-	const struct bt_gatt_attr *chrc;
-	const struct bt_gatt_attr *desc;
-
-	chrc = bt_gatt_dm_char_by_uuid(disc, BT_UUID_TOC);
-	if (!chrc) {
-		printk("Missing Thingy orientation characteristic\n");
-		goto release;
+	if (offset + len > sizeof(vnd_value)) {
+		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
 	}
 
-	desc = bt_gatt_dm_desc_by_uuid(disc, chrc, BT_UUID_TOC);
-	if (!desc) {
-		printk("Missing Thingy orientation char value descriptor\n");
-		goto release;
-	}
+	memcpy(value + offset, buf, len);
 
-	param.value_handle = desc->handle,
-
-	desc = bt_gatt_dm_desc_by_uuid(disc, chrc, BT_UUID_GATT_CCC);
-	if (!desc) {
-		printk("Missing Thingy orientation char CCC descriptor\n");
-		goto release;
-	}
-
-	param.ccc_handle = desc->handle;
-
-	err = bt_gatt_subscribe(bt_gatt_dm_conn_get(disc), &param);
-	if (err) {
-		printk("Subscribe failed (err %d)\n", err);
-	}
-
-release:
-	err = bt_gatt_dm_data_release(disc);
-	if (err) {
-		printk("Could not release discovery data, err: %d\n", err);
-	}
+	return len;
 }
 
-static void discovery_service_not_found(struct bt_conn *conn, void *ctx)
+static u8_t simulate_vnd;
+static u8_t indicating;
+static struct bt_gatt_indicate_params ind_params;
+
+static void vnd_ccc_cfg_changed(const struct bt_gatt_attr *attr, u16_t value)
 {
-	printk("Thingy orientation service not found!\n");
+	simulate_vnd = (value == BT_GATT_CCC_INDICATE) ? 1 : 0;
 }
 
-static void discovery_error_found(struct bt_conn *conn, int err, void *ctx)
+static void indicate_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+			u8_t err)
 {
-	printk("The discovery procedure failed, err %d\n", err);
+	printk("Indication %s\n", err != 0U ? "fail" : "success");
+	indicating = 0U;
 }
 
-static struct bt_gatt_dm_cb discovery_cb = {
-	.completed = discovery_completed,
-	.service_not_found = discovery_service_not_found,
-	.error_found = discovery_error_found,
+#define MAX_DATA 74
+static u8_t vnd_long_value[] = {
+		  'V', 'e', 'n', 'd', 'o', 'r', ' ', 'd', 'a', 't', 'a', '1',
+		  'V', 'e', 'n', 'd', 'o', 'r', ' ', 'd', 'a', 't', 'a', '2',
+		  'V', 'e', 'n', 'd', 'o', 'r', ' ', 'd', 'a', 't', 'a', '3',
+		  'V', 'e', 'n', 'd', 'o', 'r', ' ', 'd', 'a', 't', 'a', '4',
+		  'V', 'e', 'n', 'd', 'o', 'r', ' ', 'd', 'a', 't', 'a', '5',
+		  'V', 'e', 'n', 'd', 'o', 'r', ' ', 'd', 'a', 't', 'a', '6',
+		  '.', ' ' };
+
+static ssize_t read_long_vnd(struct bt_conn *conn,
+			     const struct bt_gatt_attr *attr, void *buf,
+			     u16_t len, u16_t offset)
+{
+	const char *value = attr->user_data;
+
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, value,
+				 sizeof(vnd_long_value));
+}
+
+static ssize_t write_long_vnd(struct bt_conn *conn,
+			      const struct bt_gatt_attr *attr, const void *buf,
+			      u16_t len, u16_t offset, u8_t flags)
+{
+	u8_t *value = attr->user_data;
+
+	if (flags & BT_GATT_WRITE_FLAG_PREPARE) {
+		return 0;
+	}
+
+	if (offset + len > sizeof(vnd_long_value)) {
+		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
+	}
+
+	memcpy(value + offset, buf, len);
+
+	return len;
+}
+
+static const struct bt_uuid_128 vnd_long_uuid = BT_UUID_INIT_128(
+	0xf3, 0xde, 0xbc, 0x9a, 0x78, 0x56, 0x34, 0x12,
+	0x78, 0x56, 0x34, 0x12, 0x78, 0x56, 0x34, 0x12);
+
+static struct bt_gatt_cep vnd_long_cep = {
+	.properties = BT_GATT_CEP_RELIABLE_WRITE,
 };
 
-static void connected(struct bt_conn *conn, u8_t conn_err)
+static int signed_value;
+
+static ssize_t read_signed(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+			   void *buf, u16_t len, u16_t offset)
 {
-	int err;
-	char addr[BT_ADDR_LE_STR_LEN];
+	const char *value = attr->user_data;
 
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, value,
+				 sizeof(signed_value));
+}
 
-	if (conn_err) {
-		printk("Failed to connect to %s (%u)\n", addr, conn_err);
-		return;
+static ssize_t write_signed(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+			    const void *buf, u16_t len, u16_t offset,
+			    u8_t flags)
+{
+	u8_t *value = attr->user_data;
+
+	if (offset + len > sizeof(signed_value)) {
+		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
 	}
 
-	printk("Connected: %s\n", addr);
+	memcpy(value + offset, buf, len);
 
-	err = bt_gatt_dm_start(conn, BT_UUID_TMS, &discovery_cb, NULL);
+	return len;
+}
+
+static const struct bt_uuid_128 vnd_signed_uuid = BT_UUID_INIT_128(
+	0xf3, 0xde, 0xbc, 0x9a, 0x78, 0x56, 0x34, 0x13,
+	0x78, 0x56, 0x34, 0x12, 0x78, 0x56, 0x34, 0x13);
+
+static const struct bt_uuid_128 vnd_write_cmd_uuid = BT_UUID_INIT_128(
+	0xf4, 0xde, 0xbc, 0x9a, 0x78, 0x56, 0x34, 0x12,
+	0x78, 0x56, 0x34, 0x12, 0x78, 0x56, 0x34, 0x12);
+
+static ssize_t write_without_rsp_vnd(struct bt_conn *conn,
+				     const struct bt_gatt_attr *attr,
+				     const void *buf, u16_t len, u16_t offset,
+				     u8_t flags)
+{
+	u8_t *value = attr->user_data;
+
+	/* Write request received. Reject it since this char only accepts
+	 * Write Commands.
+	 */
+	if (!(flags & BT_GATT_WRITE_FLAG_CMD)) {
+		return BT_GATT_ERR(BT_ATT_ERR_WRITE_REQ_REJECTED);
+	}
+
+	if (offset + len > sizeof(vnd_value)) {
+		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
+	}
+
+	memcpy(value + offset, buf, len);
+
+	return len;
+}
+
+/* Vendor Primary Service Declaration */
+BT_GATT_SERVICE_DEFINE(vnd_svc,
+	BT_GATT_PRIMARY_SERVICE(&vnd_uuid),
+	BT_GATT_CHARACTERISTIC(&vnd_enc_uuid.uuid,
+			       BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE |
+			       BT_GATT_CHRC_INDICATE,
+			       BT_GATT_PERM_READ_ENCRYPT |
+			       BT_GATT_PERM_WRITE_ENCRYPT,
+			       read_vnd, write_vnd, vnd_value),
+	BT_GATT_CCC(vnd_ccc_cfg_changed,
+		    BT_GATT_PERM_READ | BT_GATT_PERM_WRITE_ENCRYPT),
+	BT_GATT_CHARACTERISTIC(&vnd_auth_uuid.uuid,
+			       BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE,
+			       BT_GATT_PERM_READ_AUTHEN |
+			       BT_GATT_PERM_WRITE_AUTHEN,
+			       read_vnd, write_vnd, vnd_value),
+	BT_GATT_CHARACTERISTIC(&vnd_long_uuid.uuid, BT_GATT_CHRC_READ |
+			       BT_GATT_CHRC_WRITE | BT_GATT_CHRC_EXT_PROP,
+			       BT_GATT_PERM_READ | BT_GATT_PERM_WRITE |
+			       BT_GATT_PERM_PREPARE_WRITE,
+			       read_long_vnd, write_long_vnd, &vnd_long_value),
+	BT_GATT_CEP(&vnd_long_cep),
+	BT_GATT_CHARACTERISTIC(&vnd_signed_uuid.uuid, BT_GATT_CHRC_READ |
+			       BT_GATT_CHRC_WRITE | BT_GATT_CHRC_AUTH,
+			       BT_GATT_PERM_READ | BT_GATT_PERM_WRITE,
+			       read_signed, write_signed, &signed_value),
+	BT_GATT_CHARACTERISTIC(&vnd_write_cmd_uuid.uuid,
+			       BT_GATT_CHRC_WRITE_WITHOUT_RESP,
+			       BT_GATT_PERM_WRITE, NULL,
+			       write_without_rsp_vnd, &vnd_value),
+);
+
+static const struct bt_data ad[] = {
+	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
+	BT_DATA_BYTES(BT_DATA_UUID16_ALL,
+		      0x0d, 0x18, 0x0f, 0x18, 0x05, 0x18),
+	BT_DATA_BYTES(BT_DATA_UUID128_ALL,
+		      0xf0, 0xde, 0xbc, 0x9a, 0x78, 0x56, 0x34, 0x12,
+		      0x78, 0x56, 0x34, 0x12, 0x78, 0x56, 0x34, 0x12),
+};
+
+static void connected(struct bt_conn *conn, u8_t err)
+{
 	if (err) {
-		printk("Could not start service discovery, err %d\n", err);
+		printk("Connection failed (err 0x%02x)\n", err);
+	} else {
+		printk("Connected\n");
 	}
+}
+
+static void disconnected(struct bt_conn *conn, u8_t reason)
+{
+	printk("Disconnected (reason 0x%02x)\n", reason);
 }
 
 static struct bt_conn_cb conn_callbacks = {
 	.connected = connected,
+	.disconnected = disconnected,
 };
 
-void scan_filter_match(struct bt_scan_device_info *device_info,
-		       struct bt_scan_filter_match *filter_match,
-		       bool connectable)
+static void bt_ready(int err)
 {
-	char addr[BT_ADDR_LE_STR_LEN];
-
-	bt_addr_le_to_str(device_info->addr, addr, sizeof(addr));
-
-	printk("Device found: %s\n", addr);
-}
-
-void scan_connecting_error(struct bt_scan_device_info *device_info)
-{
-	printk("Connection to peer failed!\n");
-}
-
-BT_SCAN_CB_INIT(scan_cb, scan_filter_match, NULL, scan_connecting_error, NULL);
-
-static void scan_start(void)
-{
-	int err;
-
-	struct bt_le_scan_param scan_param = {
-		.type = BT_HCI_LE_SCAN_ACTIVE,
-		.filter_dup = BT_HCI_LE_SCAN_FILTER_DUP_ENABLE,
-		.interval = 0x0010,
-		.window = 0x0010,
-	};
-
-	struct bt_scan_init_param scan_init = {
-		.connect_if_match = 1,
-		.scan_param = &scan_param,
-		.conn_param = BT_LE_CONN_PARAM_DEFAULT,
-	};
-
-	bt_scan_init(&scan_init);
-	bt_scan_cb_register(&scan_cb);
-
-	err = bt_scan_filter_add(BT_SCAN_FILTER_TYPE_UUID, BT_UUID_THINGY);
 	if (err) {
-		printk("Scanning filters cannot be set\n");
+		printk("Bluetooth init failed (err %d)\n", err);
 		return;
 	}
 
-	err = bt_scan_filter_enable(BT_SCAN_UUID_FILTER, false);
-	if (err) {
-		printk("Filters cannot be turned on\n");
+	printk("Bluetooth initialized\n");
+
+	if (IS_ENABLED(CONFIG_SETTINGS)) {
+		settings_load();
 	}
 
-	err = bt_scan_start(BT_SCAN_TYPE_SCAN_ACTIVE);
+	err = bt_le_adv_start(BT_LE_ADV_CONN_NAME, ad, ARRAY_SIZE(ad), NULL, 0);
 	if (err) {
-		printk("Scanning failed to start, err %d\n", err);
+		printk("Advertising failed to start (err %d)\n", err);
+		return;
 	}
 
-	printk("Scanning...\n");
+	printk("Advertising successfully started\n");
 }
 
-static void ble_ready(int err)
+static void bas_notify(void)
 {
-	printk("Bluetooth ready\n");
+	u8_t battery_level = bt_gatt_bas_get_battery_level();
 
-	bt_conn_cb_register(&conn_callbacks);
-	scan_start();
+	battery_level--;
+
+	if (!battery_level) {
+		battery_level = 100U;
+	}
+
+	bt_gatt_bas_set_battery_level(battery_level);
 }
+
+static void hrs_notify(void)
+{
+	static u8_t heartrate = 90U;
+
+	/* Heartrate measurements simulation */
+	heartrate++;
+	if (heartrate == 160U) {
+		heartrate = 90U;
+	}
+
+	bt_gatt_hrs_notify(heartrate);
+}
+
 
 void ble_init(void)
 {
 	int err;
 
+	k_sleep(K_SECONDS(5));
+
 	printk("Initializing Bluetooth..\n");
-	err = bt_enable(ble_ready);
+	err = bt_enable(bt_ready);
 	if (err) {
 		printk("Bluetooth init failed (err %d)\n", err);
 		return;
 	}
+
+	bt_conn_cb_register(&conn_callbacks);
 }
